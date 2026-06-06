@@ -75,7 +75,9 @@ dimension *DN*:
 
 This is the backbone that reconciles "fully bespoke" with "comparable": the *wording and targets*
 are bespoke; the *dimension* is fixed. Aggregation (§10) rolls up by dimension across all 159
-languages, and by language group, without losing per-language specificity.
+languages, and by language group, without losing per-language specificity. **The dimensions
+themselves are not invented — they are anchored to the published software-comprehension literature
+and, for the major languages, cross-checked against external repo-level QA benchmarks (§3.1).**
 
 > For config / markup / schema languages (Group E) the dimensions are interpreted structurally:
 > D1 = top-level definitions, D2 = cross-file references/includes, D3 = retrieve the largest
@@ -87,6 +89,58 @@ languages, and by language group, without losing per-language specificity.
 > cross-group comparable. Likewise, on languages where a dimension barely applies (e.g. a call graph
 > on `csv`/`gitignore`), the chapter says so and that dimension is marked **N/A** rather than forcing
 > an unnatural question — N/A questions are excluded from that language's mean, not scored 0.
+
+### 3.1 External validity — questions grounded in the literature, not LLM-invented
+
+A peer reviewer raised the central validity threat for any benchmark whose questions are
+model-generated: **what claim do they have to being *typical* developer questions?** We answer this on
+two levels.
+
+**(a) D1–D5 are anchored to a citable taxonomy of real developer questions.** They map onto the
+canonical catalogue of questions programmers actually ask during software-evolution tasks — **Sillito,
+Murphy & De Volder, "Questions Programmers Ask During Software Evolution Tasks" (FSE 2006 / IEEE TSE
+2008)**: 44 question types in 4 groups. This is supplemented by **LaToza & Myers, "Hard-to-answer
+Questions about Code" (2010)** and **Ko et al., "Information Needs in Collocated Software Development
+Teams" (ICSE 2007)**, which emphasise exactly the cross-file/relational questions the graph is built
+to answer. Mapping:
+
+| Sillito group | Representative Sillito questions | Our dimension |
+|---|---|---|
+| 1 — Finding initial focus points | "Which type/function represents X?", "Where is this defined?" | **D1** Definition/API discovery |
+| 2 — Building on focus points | "What calls this? What does it call? What implements this interface?" | **D2** Relationship/call graph |
+| (reading a focus point) | "What does this code actually do?" (the definition itself) | **D3** Targeted retrieval |
+| 3 — Understanding a subgraph | "How are these objects/layers related? How does control reach here?" | **D4** Architecture/structure |
+| 4 — Questions over groups of subgraphs | "Where are the cross-cutting concerns / similar code / config↔code links?" | **D5** Cross-cutting/semantic |
+
+So each question's *phrasing and target* are bespoke per language, but its *type* belongs to an
+externally-validated set — not a taxonomy we made up. This is the defensible external-validity story
+for reviewers.
+
+**(b) For the major languages we reuse / compare against published repo-level QA benchmarks** rather
+than relying solely on our own authored questions:
+
+| Benchmark | Scale / langs | Why relevant | Use here |
+|---|---|---|---|
+| **SWE-QA** (2025, [arXiv 2509.14635](https://arxiv.org/abs/2509.14635)) | 576 repo-level Q-A pairs from 11 repos; categories incl. intention understanding, **cross-file reasoning, multi-hop dependency** | Closest published set to *our* setting (repo-level, relational) | **Primary external set** — near drop-in for the major languages; report Graph vs Explorer against it |
+| CoReQA (2025, [arXiv 2501.03447](https://arxiv.org/abs/2501.03447)) | repo-level QA from issues/comments, 176 repos, 4 langs | Independent repo-level QA | Cross-check |
+| CodeRepoQA (2024, [arXiv 2412.14764](https://arxiv.org/abs/2412.14764)) | 585k entries from issue conversations, 5 langs | Large dev-knowledge QA | Reference / sampling |
+| RepoQA (2024, [arXiv 2406.06025](https://arxiv.org/abs/2406.06025)) | "needle function" long-context retrieval, 50 repos, 5 langs | Retrieval reference | D3-style retrieval baseline |
+| CodeQA / CS1QA / CoSQA | snippet-level | Criticised by newer work as too fine-grained | Cited as the *contrast* that motivates structural retrieval |
+
+**Adopted policy (the reviewer's proposal):**
+1. **Anchor D1–D5 to Sillito** (the mapping above) for defensible external validity — stated in every
+   chapter's framing, not just here.
+2. **For the major languages** (the 9 LSP-hybrid + the most popular Group A–D languages), **reuse and
+   compare against SWE-QA** where the repo overlaps or a close analogue exists, so part of the score
+   rests on an independent, peer-published question set — not only our authored questions.
+3. **Generate the multilingual remainder ourselves, but from independent ground truth (LSP symbol /
+   reference data and git history) — never from the model.** Question *targets* come from LSP/git
+   facts, keeping authoring independent of the system under test. This reinforces the §12
+   symmetric-authoring rule and [CR-1].
+
+> This makes the benchmark's question provenance auditable: each question is (i) a Sillito-typed
+> developer question, and (ii) for major languages, corroborated by or drawn from SWE-QA; (iii) where
+> self-authored, seeded from LSP/git ground truth rather than the model under test.
 
 ---
 
@@ -920,6 +974,10 @@ D5→`search_code("instance ")` + `search_graph(name_pattern=".*walk.*|.*query.*
 - [ ] Build the `regex`/fixture-corpus directories (§8.1).
 - [ ] Generate per-language chapters (§12 template) against cloned repos using the **symmetric
       authoring split** (CR-1): D1/D3 grep-first, D2/D4 graph-first, D5 labeled graph-favoring.
+- [ ] **[Ext. validity, §3.1]** Map each chapter's 5 questions to their Sillito group; for the major
+      languages, wire in **SWE-QA** items (and CoReQA/RepoQA where useful) as an independent question
+      set and report Graph/Explorer against them; seed self-authored multilingual questions from
+      LSP/git ground truth, not the model.
 - [ ] Confirm the C cross-repo pair forms CROSS edges or document the gap (§11.1).
 
 **Run:**
