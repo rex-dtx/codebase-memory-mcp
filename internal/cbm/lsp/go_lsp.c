@@ -1222,8 +1222,13 @@ static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node) {
                                         const CBMRegisteredFunc* concrete_method =
                                             cbm_registry_lookup_method(ctx->registry, sole_impl_qn, field_name);
                                         if (concrete_method) {
+                                            // Sole-implementer interface dispatch is an unambiguous
+                                            // resolution (exactly one concrete method); rank it at least
+                                            // as high as a direct type dispatch (0.95) so the concrete
+                                            // `Type.method` wins over the interface-method type_dispatch
+                                            // for the same call site.
                                             emit_resolved_call(ctx, concrete_method->qualified_name,
-                                                "lsp_interface_resolve", 0.90f);
+                                                "lsp_interface_resolve", 0.95f);
                                             goto recurse;
                                         }
                                     }
