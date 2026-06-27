@@ -1266,6 +1266,12 @@ static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t
 static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                              const cbm_gbuf_node_t *target, const CBMCall *call,
                              const cbm_resolution_t *res, const char *arg) {
+    /* emit_service_edge may be reached with target==NULL on the HTTP/ASYNC
+     * external-client bypass (#523); a CONFIGURES edge needs a real target, so
+     * never deref a NULL target here. */
+    if (!target) {
+        return;
+    }
     char esc_c[CBM_SZ_256];
     char esc_k[CBM_SZ_256];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
@@ -1280,6 +1286,11 @@ static void emit_config_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                    const cbm_gbuf_node_t *target, const CBMCall *call,
                                    const cbm_resolution_t *res) {
+    /* A CALLS edge needs a real target; the HTTP/ASYNC external-client bypass
+     * (#523) can reach emit_service_edge with target==NULL, so guard the deref. */
+    if (!target) {
+        return;
+    }
     char esc_c[CBM_SZ_256];
     cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
     char props[CBM_SZ_2K];

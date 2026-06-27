@@ -4926,14 +4926,14 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         if (strcmp(kind, "require_directive") == 0 || strcmp(kind, "replace_directive") == 0) {
             uint32_t rc = ts_node_named_child_count(node);
             for (uint32_t i = 0; i < rc; i++) {
-                TSNode spec = ts_node_named_child(node, i);
-                const char *sk = ts_node_type(spec);
+                TSNode req_spec = ts_node_named_child(node, i);
+                const char *sk = ts_node_type(req_spec);
                 if (strcmp(sk, "require_spec") != 0 && strcmp(sk, "replace_spec") != 0) {
                     continue;
                 }
-                TSNode mp = cbm_find_child_by_kind(spec, "module_path");
+                TSNode mp = cbm_find_child_by_kind(req_spec, "module_path");
                 if (!ts_node_is_null(mp)) {
-                    push_var_def(ctx, cbm_node_text(a, mp, ctx->source), spec);
+                    push_var_def(ctx, cbm_node_text(a, mp, ctx->source), req_spec);
                 }
             }
         }
