@@ -26,6 +26,10 @@ enum {
     ST_FOUND = -1,
     ST_BUF_16 = 16,
     ST_BUF_64 = 64,
+    /* file: URI for the immutable read-only fallback. A path is at most
+     * CBM_SZ_1K; percent-encoding can triple it, plus the "file://" prefix,
+     * the "?immutable=1" suffix and a leading '/'. */
+    ST_QUERY_URI_MAX = 3 * 1024 + 64,
     ST_GROWTH = 2,
     ST_MAX_DEGREE = 8192,
     ST_HALF_SEC = 500000,
@@ -322,7 +326,16 @@ int64_t cbm_store_resolve_mmap_size(void) {
     return (int64_t)parsed;
 }
 
-static int configure_pragmas(cbm_store_t *s, bool in_memory) {
+/* Configure connection pragmas.
+ *   in_memory  — :memory: DB (synchronous OFF, no journal file).
+ *   read_only  — query-only connection opened SQLITE_OPEN_READONLY. Runs
+ *                ONLY non-writing pragmas (foreign_keys, temp_store,
+ *                busy_timeout, mmap_size) and SKIPS journal_mode=WAL,
+ *                wal_checkpoint and synchronous — those WRITE to the DB/WAL
+ *                and would (a) mutate the DB on every read query and (b)
+ *                fail on a read-only DB file / filesystem.
+ * in_memory and read_only are mutually exclusive. */
+static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
     int rc;
     rc = exec_sql(s, "PRAGMA foreign_keys = ON;");
     if (rc != CBM_STORE_OK) {
@@ -335,6 +348,16 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
 
     if (in_memory) {
         rc = exec_sql(s, "PRAGMA synchronous = OFF;");
+    } else if (read_only) {
+        /* Non-writing pragmas only — see the function comment. */
+        rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        char mmap_sql[ST_BUF_64];
+        snprintf(mmap_sql, sizeof(mmap_sql), "PRAGMA mmap_size = %lld;",
+                 (long long)cbm_store_resolve_mmap_size());
+        rc = exec_sql(s, mmap_sql);
     } else {
         rc = exec_sql(s, "PRAGMA busy_timeout = 10000;");
         if (rc != CBM_STORE_OK) {
@@ -593,7 +616,7 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
 
-    if (configure_pragmas(s, in_memory) != CBM_STORE_OK || init_schema(s) != CBM_STORE_OK ||
+    if (configure_pragmas(s, in_memory, false) != CBM_STORE_OK || init_schema(s) != CBM_STORE_OK ||
         create_user_indexes(s) != CBM_STORE_OK) {
         sqlite3_close(s->db);
         safe_str_free(&s->db_path);
@@ -615,6 +638,69 @@ cbm_store_t *cbm_store_open_path(const char *db_path) {
     return store_open_internal(db_path, false);
 }
 
+const char *cbm_store_db_path(const cbm_store_t *s) {
+    return s ? s->db_path : NULL;
+}
+
+/* Build a SQLite "file:" URI with immutable=1 from a filesystem path.
+ * immutable=1 bypasses WAL and locking and reads the main DB file directly —
+ * used only as a fallback for read-only filesystems where the wal-index
+ * (-shm) cannot be created. URI-special characters are percent-encoded.
+ * Windows backslashes are normalized to '/', and a leading '/' is inserted
+ * for drive-letter paths so the drive is not parsed as a URI authority.
+ * Returns false if the output buffer is too small. */
+static bool build_immutable_uri(const char *path, char *out, size_t out_sz) {
+    static const char PREFIX[] = "file://";
+    static const char SUFFIX[] = "?immutable=1";
+    static const char HEX[] = "0123456789ABCDEF";
+    size_t prefix_len = sizeof(PREFIX) - 1;
+    size_t suffix_len = sizeof(SUFFIX) - 1;
+    if (prefix_len + 1 > out_sz) {
+        return false;
+    }
+    memcpy(out, PREFIX, prefix_len);
+    size_t pos = prefix_len;
+
+    /* Ensure the path component begins with '/' (POSIX absolute paths already
+     * do; Windows "C:\..." gets a leading '/' -> "/C:/..."). */
+    if (path[0] != '/') {
+        if (pos + 1 >= out_sz) {
+            return false;
+        }
+        out[pos++] = '/';
+    }
+
+    for (const unsigned char *p = (const unsigned char *)path; *p != '\0'; p++) {
+        unsigned char c = *p;
+        if (c == '\\') {
+            c = '/'; /* normalize Windows separators */
+        }
+        bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                    c == '/' || c == '.' || c == '-' || c == '_' || c == '~' || c == ':';
+        if (safe) {
+            if (pos + 1 >= out_sz) {
+                return false;
+            }
+            out[pos++] = (char)c;
+        } else {
+            if (pos + 3 >= out_sz) {
+                return false;
+            }
+            out[pos++] = '%';
+            out[pos++] = HEX[(c >> 4) & 0xF];
+            out[pos++] = HEX[c & 0xF];
+        }
+    }
+
+    if (pos + suffix_len + 1 > out_sz) {
+        return false;
+    }
+    memcpy(out + pos, SUFFIX, suffix_len);
+    pos += suffix_len;
+    out[pos] = '\0';
+    return true;
+}
+
 cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     if (!db_path) {
         return NULL;
@@ -625,13 +711,52 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         return NULL;
     }
 
-    /* Open read-write but do NOT create — returns SQLITE_CANTOPEN if absent. */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READWRITE, NULL);
+    /* Query tools open the project DB READ-ONLY: a read query must never
+     * mutate the DB (the previous READWRITE open + WAL write-pragmas did),
+     * and must work on a read-only DB file / filesystem.
+     *
+     * Try a plain READONLY open first — on a normal writable filesystem this
+     * reads WAL frames correctly via the -shm wal-index. SQLite opens lazily,
+     * so a read-only-filesystem failure (cannot create -shm for a WAL-mode
+     * DB) surfaces on first access, not at open time; we probe with a trivial
+     * read to force it. If the probe fails, retry once with an immutable URI
+     * that bypasses WAL and reads the main DB file directly.
+     *
+     * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
+     * (no ghost .db for unknown/unindexed projects). */
+    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    if (rc == SQLITE_OK) {
+        /* Force first DB access so a read-only-FS WAL failure surfaces now. */
+        if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
+            SQLITE_OK) {
+            sqlite3_close(s->db);
+            s->db = NULL;
+            rc = SQLITE_CANTOPEN; /* trigger immutable fallback */
+        }
+    }
     if (rc != SQLITE_OK) {
-        /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
-        sqlite3_close(s->db);
-        free(s);
-        return NULL;
+        sqlite3_close(s->db); /* no-op if already NULL */
+        s->db = NULL;
+        /* A genuinely missing DB must return NULL without creating anything —
+         * only retry with the immutable URI when the file exists but could not
+         * be opened (the read-only-filesystem case). This also keeps the
+         * common "project not found" path to a single open attempt. */
+        if (!cbm_file_exists(db_path)) {
+            free(s);
+            return NULL;
+        }
+        char uri[ST_QUERY_URI_MAX];
+        if (!build_immutable_uri(db_path, uri, sizeof(uri))) {
+            free(s);
+            return NULL;
+        }
+        rc = sqlite3_open_v2(uri, &s->db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
+        if (rc != SQLITE_OK) {
+            /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
+            sqlite3_close(s->db);
+            free(s);
+            return NULL;
+        }
     }
 
     s->db_path = heap_strdup(db_path);
@@ -649,7 +774,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
 
-    if (configure_pragmas(s, false) != CBM_STORE_OK) {
+    if (configure_pragmas(s, false, true) != CBM_STORE_OK) {
         sqlite3_close(s->db);
         safe_str_free(&s->db_path);
         free(s);

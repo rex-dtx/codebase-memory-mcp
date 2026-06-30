@@ -4843,12 +4843,33 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     /* ADRs are stored in the SQLite store (project_summaries), the SAME
      * backend the UI /api/adr endpoints use — so writes via the MCP tool and
      * the UI are visible to each other (#256). */
-    cbm_store_t *store = resolve_store(srv, project);
-    if (!store) {
+    cbm_store_t *resolved = resolve_store(srv, project);
+    if (!resolved) {
         free(project);
         free(mode_str);
         free(content);
         return cbm_mcp_text_result("project not found", true);
+    }
+
+    /* resolve_store opens file-backed projects READ-ONLY (query stores must
+     * not mutate the DB). manage_adr is the only resolve_store caller that
+     * WRITES, so it needs a writable handle. For a file-backed project open a
+     * dedicated read-write handle to the same DB file (the project is verified
+     * to exist via resolve_store, so cbm_store_open_path won't create a ghost
+     * DB). For an in-memory / embedded store (db_path == NULL) the resolved
+     * store is already writable — use it directly. */
+    cbm_store_t *store = resolved;
+    cbm_store_t *owned_rw = NULL;
+    const char *resolved_db_path = cbm_store_db_path(resolved);
+    if (resolved_db_path) {
+        owned_rw = cbm_store_open_path(resolved_db_path);
+        if (!owned_rw) {
+            free(project);
+            free(mode_str);
+            free(content);
+            return cbm_mcp_text_result("project not found", true);
+        }
+        store = owned_rw;
     }
 
     /* One-time migration: older versions wrote ADRs to a file at
@@ -4897,6 +4918,9 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc_free(doc);
     if (have_adr) {
         cbm_store_adr_free(&adr);
+    }
+    if (owned_rw) {
+        cbm_store_close(owned_rw);
     }
     free(project);
     free(mode_str);

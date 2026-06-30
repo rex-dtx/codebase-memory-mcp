@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/stat.h> /* chmod / stat for read-only query reproductions */
 
 static char mcp_log_buf[4096];
 
@@ -2669,6 +2670,265 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  QUERY STORE READ-ONLY  (data-integrity reproductions)
+ *
+ *  Bug: query tools resolve the project store via resolve_store() ->
+ *  cbm_store_open_path_query(), which opens the DB SQLITE_OPEN_READWRITE
+ *  and runs configure_pragmas() with the WRITE pragmas
+ *  (journal_mode=WAL + wal_checkpoint + synchronous). Two consequences:
+ *    (a) read-only query tools MUTATE the on-disk DB (write pragmas), and
+ *    (b) query tools FAIL outright on a read-only DB file / filesystem
+ *        (the READWRITE open returns CANTOPEN -> resolve_store NULL ->
+ *        "project not found").
+ *  Both tests below are written reproduce-first and are RED on the
+ *  unfixed code, GREEN once query opens are READONLY with read-only
+ *  pragmas.
+ * ══════════════════════════════════════════════════════════════════ */
+
+#define ROQ_PROJECT "cbm-roq-test"
+
+/* Whole-file byte snapshot. Returns malloc'd buffer (caller frees) and
+ * writes the length to *out_len. Returns NULL on failure. */
+static unsigned char *roq_read_file_bytes(const char *path, long *out_len) {
+    *out_len = 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long sz = ftell(fp);
+    if (sz < 0) {
+        fclose(fp);
+        return NULL;
+    }
+    rewind(fp);
+    unsigned char *buf = malloc((size_t)sz > 0 ? (size_t)sz : 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    fclose(fp);
+    if (got != (size_t)sz) {
+        free(buf);
+        return NULL;
+    }
+    *out_len = sz;
+    return buf;
+}
+
+static int roq_file_exists(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0) ? 1 : 0;
+}
+
+/* ── (a) NO-MUTATION ──────────────────────────────────────────────────
+ *
+ * readonly_query_does_not_mutate_db
+ *
+ * Create a real project DB, convert it to rollback (DELETE) journal mode
+ * on disk, snapshot its exact bytes, run search_graph through the server,
+ * then re-snapshot. The buggy query path runs `PRAGMA journal_mode=WAL`,
+ * which rewrites the file header (1,1 -> 2,2) and spawns a -wal sidecar —
+ * so the snapshots differ. The fixed READONLY path runs no write pragma,
+ * so the file is byte-identical.
+ *
+ * The DELETE-mode fixture is what makes the mutation OBSERVABLE: on an
+ * already-WAL file `journal_mode=WAL` is a silent no-op, so we deliberately
+ * stage the DB in rollback mode (the same technique repro_issue557 uses to
+ * plant a deterministic trigger).
+ *
+ * WHY RED on unfixed code:
+ *   journal_mode=WAL rewrites the header -> memcmp(before, after) != 0 and
+ *   a -wal file is created while the cached store is open. Both assertions
+ *   that demand "unchanged" fire.
+ * ─────────────────────────────────────────────────────────────────── */
+TEST(readonly_query_does_not_mutate_db) {
+    char tmp_cache[512];
+    snprintf(tmp_cache, sizeof(tmp_cache), "%s/cbm_roq_a_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmp_cache)) {
+        ASSERT_NOT_NULL(NULL); /* setup failure */
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", tmp_cache, 1);
+
+    char db_path[700];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", tmp_cache, ROQ_PROJECT);
+    char wal_path[730];
+    char shm_path[730];
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+
+    /* Build the DB and flip it to rollback journal mode on disk. */
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, ROQ_PROJECT, "/tmp/roq"), CBM_STORE_OK);
+    cbm_node_t node = {.project = ROQ_PROJECT,
+                       .label = "Function",
+                       .name = "ReadOnlyProbe",
+                       .qualified_name = "roq.mod.ReadOnlyProbe",
+                       .file_path = "mod.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(setup, &node) > 0);
+    ASSERT_EQ(cbm_store_exec(setup, "PRAGMA journal_mode=DELETE;"), 0);
+    cbm_store_close(setup);
+
+    /* Snapshot BEFORE any query. */
+    long before_len = 0;
+    unsigned char *before = roq_read_file_bytes(db_path, &before_len);
+    ASSERT_NOT_NULL(before);
+
+    /* Run a query tool through the server (the resolve_store path). */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[512];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*ReadOnlyProbe.*\"}",
+             ROQ_PROJECT);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+
+    /* Capture sidecar state WHILE the cached store is still open (the buggy
+     * RW+WAL open creates -wal here; on close it would be removed again). */
+    int wal_while_open = roq_file_exists(wal_path);
+    int query_ok = (resp && strstr(resp, "ReadOnlyProbe") != NULL);
+    int query_failed = (resp && (strstr(resp, "not found") || strstr(resp, "not indexed")));
+
+    cbm_mcp_server_free(srv); /* closes the store; header change is persisted */
+
+    long after_len = 0;
+    unsigned char *after = roq_read_file_bytes(db_path, &after_len);
+
+    int identical = (before && after && before_len == after_len &&
+                     memcmp(before, after, (size_t)before_len) == 0);
+
+    if (resp) {
+        free(resp);
+    }
+    free(before);
+    free(after);
+    cbm_unlink(db_path);
+    cbm_unlink(wal_path);
+    cbm_unlink(shm_path);
+    cbm_rmdir(tmp_cache);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+
+    ASSERT_TRUE(query_ok);        /* read path ran and returned the node */
+    ASSERT_FALSE(query_failed);   /* not the "project not found" path */
+    ASSERT_TRUE(identical);       /* RED on buggy code: WAL pragma rewrote header */
+    ASSERT_FALSE(wal_while_open); /* RED on buggy code: RW+WAL open spawned -wal */
+    PASS();
+}
+
+/* ── (b) READ-ONLY FILESYSTEM ─────────────────────────────────────────
+ *
+ * readonly_query_succeeds_on_readonly_fs
+ *
+ * Create a real project DB (left in WAL journal mode, as the indexer
+ * writes it), then chmod the CONTAINING DIRECTORY to 0555 (read-only) to
+ * simulate a read-only mount / immutable media, then run search_graph.
+ *
+ * Note on why the directory (not just the file) must be read-only: SQLite's
+ * unix VFS auto-downgrades a failed O_RDWR main-db open to O_RDONLY, so a
+ * 0444 *file* alone does NOT surface the bug — the connection silently
+ * becomes read-only and, with a writable dir, still creates the WAL -shm
+ * and reads. The genuine read-only-FS symptom is the WAL write-pragma
+ * (journal_mode=WAL) being unable to create the -shm/-wal sidecars in a
+ * read-only directory.
+ *
+ * WHY RED on unfixed code:
+ *   cbm_store_open_path_query() runs configure_pragmas(.., false) which
+ *   executes `PRAGMA journal_mode = WAL`. In a read-only directory the WAL
+ *   wal-index (-shm) cannot be created, so the pragma errors ->
+ *   configure_pragmas fails -> the open returns NULL -> resolve_store()
+ *   returns NULL -> the handler emits "project not found or not indexed".
+ *
+ * GREEN on fixed code:
+ *   the READONLY open skips the WAL write-pragma; the plain READONLY open
+ *   of a WAL-mode DB in a read-only dir still needs -shm, so it fails and
+ *   the immutable-URI fallback (file:..?immutable=1) reads the main DB
+ *   file directly and the query returns the node. (This is the test that
+ *   exercises the immutable fallback path.)
+ * ─────────────────────────────────────────────────────────────────── */
+TEST(readonly_query_succeeds_on_readonly_fs) {
+    char tmp_cache[512];
+    snprintf(tmp_cache, sizeof(tmp_cache), "%s/cbm_roq_b_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmp_cache)) {
+        ASSERT_NOT_NULL(NULL); /* setup failure */
+    }
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", tmp_cache, 1);
+
+    char db_path[700];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", tmp_cache, ROQ_PROJECT);
+    char wal_path[730];
+    char shm_path[730];
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+
+    /* Build the DB in its natural WAL journal mode and ensure it is cleanly
+     * checkpointed (no -wal frames) so the immutable fallback can read all
+     * data from the main file. */
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, ROQ_PROJECT, "/tmp/roq"), CBM_STORE_OK);
+    cbm_node_t node = {.project = ROQ_PROJECT,
+                       .label = "Function",
+                       .name = "ReadOnlyProbe",
+                       .qualified_name = "roq.mod.ReadOnlyProbe",
+                       .file_path = "mod.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(setup, &node) > 0);
+    (void)cbm_store_checkpoint(setup); /* fold WAL frames into the main file */
+    cbm_store_close(setup);            /* clean close removes -wal/-shm */
+
+    /* Make the containing directory read-only (simulate a read-only mount).
+     * SQLite can still traverse + read files, but cannot create -shm/-wal. */
+    ASSERT_EQ(chmod(tmp_cache, 0555), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[512];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*ReadOnlyProbe.*\"}",
+             ROQ_PROJECT);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+
+    int query_ok = (resp && strstr(resp, "ReadOnlyProbe") != NULL);
+    int query_failed = (resp && (strstr(resp, "not found") || strstr(resp, "not indexed")));
+
+    if (resp) {
+        free(resp);
+    }
+    cbm_mcp_server_free(srv);
+
+    /* Restore write permission on the dir BEFORE unlink (cannot remove dir
+     * entries while the directory is read-only). */
+    chmod(tmp_cache, 0755);
+    cbm_unlink(db_path);
+    cbm_unlink(wal_path);
+    cbm_unlink(shm_path);
+    cbm_rmdir(tmp_cache);
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+
+    ASSERT_FALSE(query_failed); /* RED on buggy code: WAL pragma fails on RO dir */
+    ASSERT_TRUE(query_ok);      /* RED on buggy code: no node returned */
+    PASS();
+}
+
+#undef ROQ_PROJECT
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -2780,6 +3040,10 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
+
+    /* Query store read-only (data integrity) */
+    RUN_TEST(readonly_query_does_not_mutate_db);
+    RUN_TEST(readonly_query_succeeds_on_readonly_fs);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);
